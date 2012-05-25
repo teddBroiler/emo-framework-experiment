@@ -2,3 +2,7 @@
 /gen
 /project.properties
 /obj
+/.externalToolBuilders
+/.cproject
+/.project
+/.settings
