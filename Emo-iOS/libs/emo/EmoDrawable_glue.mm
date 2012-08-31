@@ -25,6 +25,9 @@
 // OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, 
 // EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 // 
+
+extern "C" {
+    
 #import "EmoDrawable_glue.h"
 #import "EmoEngine_glue.h"
 #import "Constants.h"
@@ -58,6 +61,7 @@ void initDrawableFunctions() {
 	registerClassFunc(engine.sqvm, EMO_STAGE_CLASS,    "createSnapshot",   emoDrawableCreateSnapshot);
 	registerClassFunc(engine.sqvm, EMO_STAGE_CLASS,    "createMapSprite",     emoDrawableCreateMapSprite);
     registerClassFunc(engine.sqvm, EMO_STAGE_CLASS,    "loadMapSprite",    emoDrawableLoadMapSprite);
+    registerClassFunc(engine.sqvm, EMO_STAGE_CLASS,    "getMapData",       emoDrawableGetMapDataFromTmx);
     registerClassFunc(engine.sqvm, EMO_STAGE_CLASS,    "addTileRow",       emoDrawableAddTileRow);
     registerClassFunc(engine.sqvm, EMO_STAGE_CLASS,    "clearTiles",       emoDrawableClearTiles);
     registerClassFunc(engine.sqvm, EMO_STAGE_CLASS,    "setTileAt",        emoDrawableSetTileAt);
@@ -95,6 +99,7 @@ void initDrawableFunctions() {
 	registerClassFunc(engine.sqvm, EMO_STAGE_CLASS,    "windowHeight",   emoGetWindowHeight);
 	registerClassFunc(engine.sqvm, EMO_STAGE_CLASS,    "show",           emoDrawableShow);
 	registerClassFunc(engine.sqvm, EMO_STAGE_CLASS,    "hide",           emoDrawableHide);
+    registerClassFunc(engine.sqvm, EMO_STAGE_CLASS,    "setAsGui",       emoDrawableSetAsGui);
 	registerClassFunc(engine.sqvm, EMO_STAGE_CLASS,    "red",            emoDrawableColorRed);
 	registerClassFunc(engine.sqvm, EMO_STAGE_CLASS,    "green",          emoDrawableColorGreen);
 	registerClassFunc(engine.sqvm, EMO_STAGE_CLASS,    "blue",           emoDrawableColorBlue);
@@ -122,6 +127,7 @@ void initDrawableFunctions() {
     registerClassFunc(engine.sqvm, EMO_STAGE_CLASS,    "updatePointDrawablePointCount",   emoPointDrawableUpdatePointCount);
     registerClassFunc(engine.sqvm, EMO_STAGE_CLASS,    "getPointDrawablePointCount",      emoPointDrawableGetPointCount);
     registerClassFunc(engine.sqvm, EMO_STAGE_CLASS,    "isOffscreenSupported",            emoStageIsOffscreenSupported);
+    registerClassFunc(engine.sqvm, EMO_STAGE_CLASS,    "moveCamera",      emoStageMoveCamera);
 
     registerClassFunc(engine.sqvm, EMO_STAGE_CLASS,    "blendFunc",      emoDrawableBlendFunc);
 }
@@ -278,7 +284,7 @@ SQInteger emoDrawableCreateLine(HSQUIRRELVM v) {
 	drawable.y2 = y2;
 	
 	drawable.width  = 1;
-	drawable.height = abs(y1 - y2);
+	drawable.height = fabs(y1 - y2);
 	
     [drawable createTextureBuffer];
 	
@@ -1613,6 +1619,34 @@ SQInteger emoDrawableHide(HSQUIRRELVM v) {
     return 1;
 }
 
+/*
+ * set selected drawable as GUI component(non camera object)
+ */
+SQInteger emoDrawableSetAsGui(HSQUIRRELVM v) {
+    const SQChar* id;
+    SQInteger nargs = sq_gettop(v);
+    if (nargs >= 2 && sq_gettype(v, 2) == OT_STRING) {
+        sq_tostring(v, 2);
+        sq_getstring(v, -1, &id);
+        sq_poptop(v);
+    } else {
+        sq_pushinteger(v, ERR_INVALID_PARAM);
+        return 1;
+    }
+
+    EmoDrawable* drawable = [engine getDrawable:id];
+
+    if (drawable == nil) {
+        sq_pushinteger(v, ERR_INVALID_ID);
+        return 1;
+    }
+
+    drawable.isCameraObject = false;
+
+    sq_pushinteger(v, EMO_NO_ERROR);
+    return 1;
+}
+
 SQInteger emoDrawableColorRed(HSQUIRRELVM v) {
     const SQChar* id;
     SQInteger nargs = sq_gettop(v);
@@ -2681,6 +2715,39 @@ SQInteger emoStageIsOffscreenSupported(HSQUIRRELVM v) {
 }
 
 /*
+ * move relative camera to the given coordinate
+ *
+ * @param x
+ * @param y
+ */
+SQInteger emoStageMoveCamera(HSQUIRRELVM v) {
+    SQInteger nargs = sq_gettop(v);
+    SQFloat x;
+    SQFloat y;
+
+    if (nargs >= 2 && sq_gettype(v, 2) != OT_NULL) {
+        sq_getfloat(v, 2, &x);
+    } else {
+        sq_pushinteger(v, ERR_INVALID_PARAM);
+        return 1;
+    }
+    if (nargs >= 3 && sq_gettype(v, 3) != OT_NULL) {
+        sq_getfloat(v, 3, &y);
+    }else{
+        sq_pushinteger(v, ERR_INVALID_PARAM);
+        return 1;
+    }
+
+    //char msg [128];
+    //sprintf(msg,"CameraInfo : x = %f, y = %f", x, y);
+    //LOGI(msg);
+
+    [engine.stage moveRelativeCameraX:x y:y];
+    sq_pushinteger(v, EMO_NO_ERROR);
+    return 1;
+}
+
+/*
  * Set blend function of the sprite
  */
 SQInteger emoDrawableBlendFunc(HSQUIRRELVM v) {
@@ -2717,3 +2784,163 @@ SQInteger emoDrawableBlendFunc(HSQUIRRELVM v) {
     sq_pushinteger(v, EMO_NO_ERROR);
     return 1;
 }
+
+} // extern "C"
+
+extern "C++" {
+
+#include <string>
+#include <vector>
+#include <rapidxml/rapidxml.h>
+
+using namespace std;
+
+vector<string> split( string s, string c );
+    
+/*
+ * get map data from ".tmx" file (XML).
+ *
+ * @param id tmx file name
+ * @returns EMO_NO_ERROR if succeeds
+ */
+SQInteger emoDrawableGetMapDataFromTmx(HSQUIRRELVM v) {
+    const char *delim = ",";
+    const char *LF = "\n";
+    
+    const SQChar* id;
+    SQInteger nargs = sq_gettop(v);
+    if (nargs >= 2 && sq_gettype(v, 2) == OT_STRING) {
+        sq_tostring(v, 2);
+        sq_getstring(v, -1, &id);
+        sq_poptop(v);
+    } else {
+        return 0;
+    }
+    
+    string fname = id;
+    // check if the length is shorter than the length of ".xml"
+    if (fname.length() <= 4) return false;
+    const char *data = [engine loadContentFromResource:fname.c_str()];
+    
+    rapidxml::xml_document<char> doc;
+    doc.parse<0>((char *)data);
+    
+    // retrieving map node
+    rapidxml::xml_node<> * mapnode = doc.first_node("map");
+    
+    rapidxml::xml_attribute<> * ch = NULL;
+    
+    sq_pushroottable(v);
+    
+    sq_pushstring(v, "mapdata", -1);
+    sq_newtable(v);
+    
+    // create tileset array
+    sq_pushstring(v, "tileset", -1); //2
+    sq_newarray(v, 0);
+    
+    // retrieving tileset node
+    for (rapidxml::xml_node<> * tilesetnode = mapnode->first_node("tileset");
+         tilesetnode; tilesetnode = tilesetnode->next_sibling("tileset")) {
+        
+        sq_newtable(v);
+        
+        ch = tilesetnode->first_attribute("firstgid");
+        sq_pushstring(v, "firstgid", -1);
+        sq_pushstring(v, ch->value(), -1);
+        sq_newslot(v, -3, SQFalse);
+        
+        ch = tilesetnode->first_attribute("name");
+        sq_pushstring(v, "name", -1);
+        sq_pushstring(v, ch->value(), -1);
+        sq_newslot(v, -3, SQFalse);
+        
+        ch = tilesetnode->first_attribute("tilewidth");
+        sq_pushstring(v, "tilewidth", -1);
+        sq_pushinteger(v, atoi(ch->value()));
+        sq_newslot(v, -3, SQFalse);
+        
+        ch = tilesetnode->first_attribute("tileheight");
+        sq_pushstring(v, "tileheight", -1);
+        sq_pushinteger(v, atoi(ch->value()));
+        sq_newslot(v, -3, SQFalse);
+        
+        // retrieving image node
+        rapidxml::xml_node<> * imagenode = tilesetnode->first_node("image");
+        ch = imagenode->first_attribute("source");
+        sq_pushstring(v, "source", -1);
+        sq_pushstring(v, ch->value(), -1);
+        sq_newslot(v, -3, SQFalse);
+        
+        ch = imagenode->first_attribute("trans");
+        sq_pushstring(v, "trans", -1);
+        sq_pushstring(v, ch->value(), -1);
+        sq_newslot(v, -3, SQFalse);
+        
+        ch = imagenode->first_attribute("width");
+        sq_pushstring(v, "width", -1);
+        sq_pushinteger(v, atoi(ch->value()));
+        sq_newslot(v, -3, SQFalse);
+        
+        ch = imagenode->first_attribute("height");
+        sq_pushstring(v, "height", -1);
+        sq_pushinteger(v, atoi(ch->value()));
+        sq_newslot(v, -3, SQFalse);
+        
+        sq_arrayappend(v, -2);
+    }
+    sq_newslot(v, -3, SQFalse);
+    
+    // create layer array
+    sq_pushstring(v, "layer", -1); //2
+    sq_newarray(v, 0);
+    
+    // retrieving layer node
+    for (rapidxml::xml_node<> * layernode = mapnode->first_node("layer");
+         layernode; layernode = layernode->next_sibling("layer")) {
+        sq_newtable(v);
+        
+        ch = layernode->first_attribute("name");
+        sq_pushstring(v, "name", -1);
+        sq_pushstring(v, ch->value(), -1);
+        sq_newslot(v, -3, SQFalse);
+        
+        ch = layernode->first_attribute("width");
+        sq_pushstring(v, "width", -1);
+        sq_pushinteger(v, atoi(ch->value()));
+        sq_newslot(v, -3, SQFalse);
+        
+        ch = layernode->first_attribute("height");
+        sq_pushstring(v, "height", -1);
+        sq_pushinteger(v, atoi(ch->value()));
+        sq_newslot(v, -3, SQFalse);
+        
+        // retrieving data node
+        rapidxml::xml_node<> * datanode = layernode->first_node("data");
+        
+        sq_pushstring(v, "data", -1);
+        sq_newarray(v, 0);
+        
+        vector <string> lines = split(datanode->value(), LF);
+        for(unsigned int i = 0; i < lines.size() ; i++){
+            vector <string> chNums = split(lines[i], delim);
+            if(chNums.size() == 1) continue;// ignore empty lines
+            
+            sq_newarray(v, 0);
+            for(unsigned int j = 0 ; j < chNums.size() ; j++){
+                if(chNums[j].size() == 0) continue;
+                sq_pushinteger(v, atoi(chNums[j].c_str()) - 1 ); // -1 for emo-framework
+                sq_arrayappend(v, -2);
+            }
+            sq_arrayappend(v, -2);
+        }
+        sq_newslot(v, -3, SQFalse);
+        
+        sq_arrayappend(v, -2);
+    }
+    sq_newslot(v, -3, SQFalse);
+    
+    return 1;
+}
+
+} // extern "C++"
